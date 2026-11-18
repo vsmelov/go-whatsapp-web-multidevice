@@ -14,6 +14,7 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
 	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/types"
 )
 
 type serviceChat struct {
@@ -439,4 +440,167 @@ func (service serviceChat) ArchiveChat(ctx context.Context, request domainChat.A
 	}).Info("Chat archive operation completed successfully")
 
 	return response, nil
+}
+
+// backfillDefaultCount is the page size whatsmeow recommends for on-demand history requests.
+const backfillDefaultCount = 50
+
+// BackfillChat asks the primary device (phone) for older history of one chat.
+//
+// It builds a HISTORY_SYNC_ON_DEMAND peer message anchored at the oldest message
+// stored for the chat (or at an explicitly supplied anchor) and sends it to the
+// account's own devices. Nothing is delivered to the chat or its participants.
+// The phone answers asynchronously with a HistorySync event of type ON_DEMAND,
+// which the history sync handler writes into chat storage, so callers should
+// poll the message count / oldest message afterwards.
+func (service serviceChat) BackfillChat(ctx context.Context, request domainChat.BackfillChatRequest) (response domainChat.BackfillChatResponse, err error) {
+	if err = validations.ValidateBackfillChat(ctx, &request); err != nil {
+		return response, err
+	}
+	if request.Count == 0 {
+		request.Count = backfillDefaultCount
+	}
+
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return response, pkgError.ErrWaCLI
+	}
+	if !client.IsConnected() {
+		return response, pkgError.ErrNotConnected
+	}
+	if !client.IsLoggedIn() {
+		return response, pkgError.ErrNotLoggedIn
+	}
+
+	deviceID := deviceIDFromContext(ctx)
+	if deviceID == "" {
+		return response, fmt.Errorf("device identification required")
+	}
+
+	chatJID, err := types.ParseJID(request.ChatJID)
+	if err != nil {
+		return response, pkgError.ValidationError(fmt.Sprintf("invalid chat_jid: %v", err))
+	}
+	if chatJID.Server != types.DefaultUserServer && chatJID.Server != types.GroupServer && chatJID.Server != types.HiddenUserServer {
+		return response, pkgError.ValidationError("backfill is supported for user and group chats only")
+	}
+
+	storedCount, err := service.chatStorageRepo.GetChatMessageCountByDevice(deviceID, request.ChatJID)
+	if err != nil {
+		logrus.WithError(err).WithField("chat_jid", request.ChatJID).Error("Failed to count stored messages for backfill")
+		return response, err
+	}
+
+	anchor := domainChat.BackfillAnchor{}
+	var anchorTime time.Time
+	if request.AnchorMessageID != "" {
+		anchorTime, err = time.Parse(time.RFC3339, request.AnchorTimestamp)
+		if err != nil {
+			return response, pkgError.ValidationError(fmt.Sprintf("invalid anchor_timestamp format: %v", err))
+		}
+		anchor.MessageID = request.AnchorMessageID
+		anchor.IsFromMe = request.AnchorIsFromMe
+	} else {
+		oldest, err := service.oldestStoredMessage(deviceID, request.ChatJID, storedCount)
+		if err != nil {
+			logrus.WithError(err).WithField("chat_jid", request.ChatJID).Error("Failed to load oldest stored message for backfill")
+			return response, err
+		}
+		if oldest == nil {
+			return response, pkgError.ValidationError("no stored message to anchor the backfill on; pass anchor_message_id, anchor_timestamp and anchor_is_from_me")
+		}
+		anchorTime = oldest.Timestamp
+		anchor.MessageID = oldest.ID
+		anchor.IsFromMe = oldest.IsFromMe
+		anchor.SenderJID = oldest.Sender
+	}
+	anchor.Timestamp = anchorTime.UTC().Format(time.RFC3339)
+
+	// The phone keys some 1:1 chats by phone number and some by LID; the stored
+	// chat JID is the phone-number form. use_lid lets the caller retry with the LID.
+	requestJID := chatJID
+	if request.UseLID && chatJID.Server == types.DefaultUserServer {
+		if client.Store == nil || client.Store.LIDs == nil {
+			return response, fmt.Errorf("LID store is not available")
+		}
+		lid, lidErr := client.Store.LIDs.GetLIDForPN(ctx, chatJID)
+		if lidErr != nil {
+			return response, fmt.Errorf("failed to resolve LID for %s: %w", chatJID.String(), lidErr)
+		}
+		if lid.IsEmpty() {
+			return response, fmt.Errorf("no LID known for %s", chatJID.String())
+		}
+		requestJID = lid
+	}
+
+	anchorInfo := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     requestJID,
+			IsFromMe: anchor.IsFromMe,
+			IsGroup:  chatJID.Server == types.GroupServer,
+		},
+		ID:        anchor.MessageID,
+		Timestamp: anchorTime,
+	}
+
+	// Peer message: goes only to this account's own devices, never to the chat.
+	sendResp, err := client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(anchorInfo, request.Count))
+	if err != nil {
+		logrus.WithError(err).WithField("chat_jid", request.ChatJID).Error("Failed to send on-demand history sync request")
+		return response, err
+	}
+
+	response.Status = "success"
+	response.Message = "History backfill requested; the phone answers asynchronously (HistorySync ON_DEMAND)"
+	response.ChatJID = request.ChatJID
+	response.RequestJID = requestJID.String()
+	response.Count = request.Count
+	response.Anchor = anchor
+	response.RequestMessageID = sendResp.ID
+	response.StoredMessages = storedCount
+
+	logrus.WithFields(logrus.Fields{
+		"chat_jid":          request.ChatJID,
+		"request_jid":       response.RequestJID,
+		"count":             request.Count,
+		"anchor_message_id": anchor.MessageID,
+		"anchor_timestamp":  anchor.Timestamp,
+		"stored_messages":   storedCount,
+	}).Info("On-demand history sync requested")
+
+	return response, nil
+}
+
+// oldestStoredMessage returns the earliest real message stored for the chat.
+// Synthetic rows that the phone does not know about (incoming call records) are
+// skipped, because their IDs cannot serve as a history sync anchor.
+func (service serviceChat) oldestStoredMessage(deviceID, chatJID string, storedCount int64) (*domainChatStorage.Message, error) {
+	if storedCount <= 0 {
+		return nil, nil
+	}
+	// GetMessages orders newest first, so the oldest rows are the tail of the list.
+	const window = 20
+	offset := int(storedCount) - window
+	if offset < 0 {
+		offset = 0
+	}
+	messages, err := service.chatStorageRepo.GetMessages(&domainChatStorage.MessageFilter{
+		DeviceID: deviceID,
+		ChatJID:  chatJID,
+		Limit:    window,
+		Offset:   offset,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var oldest *domainChatStorage.Message
+	for _, message := range messages {
+		if message == nil || message.ID == "" || message.MediaType == "call" {
+			continue
+		}
+		if oldest == nil || message.Timestamp.Before(oldest.Timestamp) {
+			oldest = message
+		}
+	}
+	return oldest, nil
 }

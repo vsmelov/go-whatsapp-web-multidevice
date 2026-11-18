@@ -105,3 +105,40 @@ type ArchiveChatResponse struct {
 	ChatJID  string `json:"chat_jid"`
 	Archived bool   `json:"archived"`
 }
+
+// Backfill (on-demand history sync) operations.
+// Asks the primary device (phone) for up to Count messages that precede the
+// anchor message. Nothing is sent to the chat itself: the request is a peer
+// protocol message to the account's own devices. The answer arrives
+// asynchronously as a HistorySync event of type ON_DEMAND and is written to
+// chat storage by the history sync handler.
+type BackfillChatRequest struct {
+	ChatJID string `json:"chat_jid" uri:"chat_jid"`
+	// Count is the number of messages to request (1..50, default 50).
+	Count int `json:"count"`
+	// Optional explicit anchor. When AnchorMessageID is empty the oldest stored
+	// message of the chat is used.
+	AnchorMessageID string `json:"anchor_message_id"`
+	AnchorTimestamp string `json:"anchor_timestamp"` // RFC3339, required with AnchorMessageID
+	AnchorIsFromMe  bool   `json:"anchor_is_from_me"`
+	// UseLID addresses the chat by its @lid JID in the request (1:1 chats only).
+	UseLID bool `json:"use_lid"`
+}
+
+type BackfillAnchor struct {
+	MessageID string `json:"message_id"`
+	Timestamp string `json:"timestamp"`
+	IsFromMe  bool   `json:"is_from_me"`
+	SenderJID string `json:"sender_jid"`
+}
+
+type BackfillChatResponse struct {
+	Status           string         `json:"status"`
+	Message          string         `json:"message"`
+	ChatJID          string         `json:"chat_jid"`
+	RequestJID       string         `json:"request_jid"`
+	Count            int            `json:"count"`
+	Anchor           BackfillAnchor `json:"anchor"`
+	RequestMessageID string         `json:"request_message_id"`
+	StoredMessages   int64          `json:"stored_messages"`
+}

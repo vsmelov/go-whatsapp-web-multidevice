@@ -67,8 +67,11 @@ func processHistorySync(ctx context.Context, data *waHistorySync.HistorySync, ch
 	log.Infof("Processing history sync type: %s", syncType.String())
 
 	switch syncType {
-	case waHistorySync.HistorySync_INITIAL_BOOTSTRAP, waHistorySync.HistorySync_RECENT:
-		// Process conversation messages
+	case waHistorySync.HistorySync_INITIAL_BOOTSTRAP, waHistorySync.HistorySync_RECENT,
+		waHistorySync.HistorySync_FULL, waHistorySync.HistorySync_ON_DEMAND:
+		// Process conversation messages.
+		// FULL and ON_DEMAND carry older pages of history: ON_DEMAND is the phone's
+		// answer to a BuildHistorySyncRequest peer message (see usecase BackfillChat).
 		return processConversationMessages(ctx, data, chatStorageRepo, client)
 	case waHistorySync.HistorySync_PUSH_NAME:
 		// Process push names to update chat names
@@ -84,6 +87,11 @@ func processHistorySync(ctx context.Context, data *waHistorySync.HistorySync, ch
 func processConversationMessages(ctx context.Context, data *waHistorySync.HistorySync, chatStorageRepo domainChatStorage.IChatStorageRepository, client *whatsmeow.Client) error {
 	conversations := data.GetConversations()
 	log.Infof("Processing %d conversations from history sync", len(conversations))
+
+	// FULL / ON_DEMAND deliver OLD pages of a chat that usually already exists.
+	// For those the chat row must not be moved backwards (see below).
+	isBackfill := data.GetSyncType() == waHistorySync.HistorySync_FULL ||
+		data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND
 
 	// Prioritize device JID from context (set by event handler with correct device instance)
 	// over client.Store.ID which may point to a different device in multi-device scenarios
@@ -282,6 +290,23 @@ func processConversationMessages(ctx context.Context, data *waHistorySync.Histor
 				Name:                chatName,
 				LastMessageTime:     latestTimestamp,
 				EphemeralExpiration: ephemeralExpiration,
+			}
+
+			// Backfill pages are older than what is already stored: keep the existing
+			// chat row's name / archived flag / disappearing timer and never let
+			// last_message_time go backwards (StoreChat overwrites all of them).
+			if isBackfill {
+				if existing, err := chatStorageRepo.GetChatByDevice(deviceID, chatJID); err == nil && existing != nil {
+					if existing.Name != "" {
+						chat.Name = existing.Name
+					}
+					chat.Archived = existing.Archived
+					chat.EphemeralExpiration = existing.EphemeralExpiration
+					if existing.LastMessageTime.After(chat.LastMessageTime) {
+						chat.LastMessageTime = existing.LastMessageTime
+					}
+				}
+				log.Infof("History backfill (%s): %d messages for chat %s", data.GetSyncType().String(), len(messageBatch), chatJID)
 			}
 
 			// Store or update the chat

@@ -23,6 +23,7 @@ func InitRestChat(app fiber.Router, service domainChat.IChatUsecase) Chat {
 	app.Post("/chat/:chat_jid/pin", rest.PinChat)
 	app.Post("/chat/:chat_jid/disappearing", rest.SetDisappearingTimer)
 	app.Post("/chat/:chat_jid/archive", rest.ArchiveChat)
+	app.Post("/chat/:chat_jid/backfill", rest.BackfillChat)
 
 	return rest
 }
@@ -195,6 +196,51 @@ func (controller *Chat) ArchiveChat(c fiber.Ctx) error {
 	}
 
 	response, err := controller.Service.ArchiveChat(whatsapp.ContextWithDevice(c.Context(), getDeviceFromCtx(c)), request)
+	utils.PanicIfNeeded(err)
+
+	return c.JSON(utils.ResponseData{
+		Status:  200,
+		Code:    "SUCCESS",
+		Message: response.Message,
+		Results: response,
+	})
+}
+
+// BackfillChat requests older history of a chat from the primary device
+// (on-demand history sync). Body is optional JSON: {"count": 1..50,
+// "anchor_message_id", "anchor_timestamp", "anchor_is_from_me", "use_lid"};
+// "count" may also be given as a query parameter.
+func (controller *Chat) BackfillChat(c fiber.Ctx) error {
+	var request domainChat.BackfillChatRequest
+
+	// Parse JSON body (optional)
+	if len(c.Body()) > 0 {
+		if err := c.Bind().Body(&request); err != nil {
+			return c.Status(400).JSON(utils.ResponseData{
+				Status:  400,
+				Code:    "BAD_REQUEST",
+				Message: "Invalid request body",
+				Results: nil,
+			})
+		}
+	}
+	if request.Count == 0 {
+		request.Count = fiber.Query[int](c, "count", 0)
+	}
+
+	// Parse path parameter (always wins over a chat_jid in the body)
+	chatJID, err := chatJIDParam(c)
+	if err != nil {
+		return c.Status(400).JSON(utils.ResponseData{
+			Status:  400,
+			Code:    "BAD_REQUEST",
+			Message: "invalid chat_jid path parameter: " + err.Error(),
+			Results: nil,
+		})
+	}
+	request.ChatJID = chatJID
+
+	response, err := controller.Service.BackfillChat(whatsapp.ContextWithDevice(c.Context(), getDeviceFromCtx(c)), request)
 	utils.PanicIfNeeded(err)
 
 	return c.JSON(utils.ResponseData{

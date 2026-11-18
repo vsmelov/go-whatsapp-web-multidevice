@@ -102,3 +102,20 @@ func ValidateArchiveChat(ctx context.Context, request *domainChat.ArchiveChatReq
 
 	return nil
 }
+
+// ValidateBackfillChat validates an on-demand history backfill request.
+// Count 0 means "use the default"; anything above 50 is rejected because the
+// phone is asked for at most 50 messages per request.
+func ValidateBackfillChat(ctx context.Context, request *domainChat.BackfillChatRequest) error {
+	err := validation.ValidateStructWithContext(ctx, request,
+		validation.Field(&request.ChatJID, validation.Required),
+		validation.Field(&request.Count, validation.Min(0), validation.Max(50)),
+		validation.Field(&request.AnchorTimestamp, validation.When(request.AnchorMessageID != "", validation.Required)),
+	)
+
+	if err != nil {
+		return pkgError.ValidationError(err.Error())
+	}
+
+	return nil
+}
